@@ -1,0 +1,34 @@
+---
+- name: Проверить readiness с целевого хоста
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ notes_app_port }}/readyz"
+    status_code: 200
+    return_content: true
+  register: notes_ready_response
+
+- name: Получить параметры контейнера приложения
+  community.docker.docker_container_info:
+    name: "{{ notes_compose_project_name }}-app-1"
+  register: notes_app_info
+
+- name: Получить параметры контейнера PostgreSQL
+  community.docker.docker_container_info:
+    name: "{{ notes_compose_project_name }}-db-1"
+  register: notes_db_info
+
+- name: Проверить изоляцию, логирование и здоровье
+  ansible.builtin.assert:
+    that:
+      - notes_ready_response.json.database == 'ok'
+      - notes_app_info.exists
+      - notes_db_info.exists
+      - notes_app_info.container.Config.User == '10001:10001'
+      - notes_app_info.container.State.Health.Status == 'healthy'
+      - notes_db_info.container.State.Health.Status == 'healthy'
+      - notes_app_info.container.HostConfig.LogConfig.Type == 'json-file'
+      - notes_app_info.container.HostConfig.LogConfig.Config['max-size'] == notes_docker_log_max_size
+      - notes_app_info.container.HostConfig.LogConfig.Config['max-file'] == (notes_docker_log_max_file | string)
+      - notes_app_info.container.HostConfig.PortBindings['8000/tcp'][0].HostIp == '127.0.0.1'
+      - notes_db_info.container.HostConfig.PortBindings | default({}, true) | length == 0
+    fail_msg: Контейнеры запущены, но один из ожидаемых параметров отличается.
+    quiet: true

@@ -1,0 +1,251 @@
+---
+- name: Проверить платформу и обязательные параметры
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == 'Ubuntu'
+      - ansible_facts['distribution_version'] is version('22.04', '==')
+      - notes_postgres_password is string
+      - notes_postgres_password | length >= 16
+      - notes_postgres_password is match('^[A-Za-z0-9._~!@#%+=:,/-]+$')
+      - notes_postgres_db is match('^[A-Za-z_][A-Za-z0-9_]*$')
+      - notes_postgres_user is match('^[A-Za-z_][A-Za-z0-9_]*$')
+      - notes_ssh_allowed_cidrs | length > 0
+      - notes_app_port | int >= 1024
+      - notes_app_port | int <= 65535
+      - notes_ssh_port | int > 0
+      - notes_ssh_port | int <= 65535
+      - notes_ssh_port | int == (ansible_port | default(22) | int)
+      - notes_stop_grace_period_seconds | int > (notes_shutdown_delay_seconds | int + 60)
+      - notes_docker_log_max_size is match('^[1-9][0-9]*[kKmMgG]$')
+      - notes_docker_log_max_file | int > 0
+      - (notes_compose_project_name ~ '-app-1') not in notes_legacy_container_names
+      - (notes_compose_project_name ~ '-db-1') not in notes_legacy_container_names
+    fail_msg: >-
+      Требуются Ubuntu 22.04, пароль БД длиной от 16 символов без кавычек,
+      пробелов, обратной косой черты и знака $, совпадение notes_ssh_port
+      с ansible_port, допустимые порты и stop_grace_period более 60 с
+      + задержка shutdown. Нельзя удалять текущие Compose-контейнеры
+      через notes_legacy_container_names.
+    quiet: true
+
+- name: Установить базовые пакеты
+  ansible.builtin.apt:
+    name: "{{ notes_docker_prerequisite_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Разрешить SSH до включения firewall
+  community.general.ufw:
+    rule: allow
+    proto: tcp
+    from_ip: "{{ item }}"
+    to_port: "{{ notes_ssh_port | string }}"
+    comment: Ansible SSH access
+  loop: "{{ notes_ssh_allowed_cidrs }}"
+
+- name: Запретить незапрошенные входящие подключения к хосту
+  community.general.ufw:
+    direction: incoming
+    default: deny
+
+- name: Разрешить исходящие подключения хоста
+  community.general.ufw:
+    direction: outgoing
+    default: allow
+
+- name: Включить firewall и автозапуск
+  community.general.ufw:
+    state: enabled
+
+- name: Получить список установленных пакетов
+  ansible.builtin.package_facts:
+    manager: apt
+
+- name: Удалить конфликтующие пакеты Docker из Ubuntu
+  ansible.builtin.apt:
+    name: "{{ notes_docker_conflicting_packages | intersect(ansible_facts.packages.keys() | list) }}"
+    state: absent
+  when: notes_docker_conflicting_packages | intersect(ansible_facts.packages.keys() | list) | length > 0
+
+- name: Создать каталог для ключей APT
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Скачать ключ официального репозитория Docker
+  ansible.builtin.get_url:
+    url: "{{ notes_docker_gpg_url }}"
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Определить архитектуру Debian-пакетов
+  ansible.builtin.command:
+    argv:
+      - dpkg
+      - --print-architecture
+  register: notes_dpkg_arch
+  changed_when: false
+
+- name: Добавить официальный репозиторий Docker
+  ansible.builtin.template:
+    src: docker.sources.j2
+    dest: /etc/apt/sources.list.d/docker.sources
+    owner: root
+    group: root
+    mode: "0644"
+  register: notes_docker_apt_source
+
+- name: Установить Docker Engine и Compose plugin
+  ansible.builtin.apt:
+    name: "{{ notes_docker_packages }}"
+    state: present
+    update_cache: "{{ notes_docker_apt_source.changed or ('docker-ce' not in ansible_facts.packages) }}"
+    cache_valid_time: 0
+
+- name: Создать каталог конфигурации Docker
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Проверить наличие существующего daemon.json
+  ansible.builtin.stat:
+    path: /etc/docker/daemon.json
+  register: notes_daemon_file
+
+- name: Прочитать существующий daemon.json
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  register: notes_daemon_file_content
+  when: notes_daemon_file.stat.exists
+
+- name: Настроить JSON-логирование Docker с ротацией
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: >-
+      {{
+        (
+          notes_daemon_file_content.content
+          | default('e30=')
+          | b64decode
+          | from_json
+        )
+        | combine({
+            'log-driver': 'json-file',
+            'log-opts': {
+              'max-size': notes_docker_log_max_size | string,
+              'max-file': notes_docker_log_max_file | string
+            }
+          })
+        | to_nice_json
+      }}
+    validate: "/usr/bin/dockerd --validate --config-file=%s"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  notify: Restart Docker daemon
+
+- name: Запустить Docker и включить автозапуск
+  ansible.builtin.systemd_service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Применить настройки демона до создания контейнеров
+  ansible.builtin.meta: flush_handlers
+
+- name: Создать каталог приложения
+  ansible.builtin.file:
+    path: "{{ notes_deploy_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Получить исходный код приложения без изменений
+  ansible.builtin.git:
+    repo: "{{ notes_app_git_url }}"
+    version: "{{ notes_app_git_version }}"
+    dest: "{{ notes_deploy_dir }}"
+    force: true
+    update: true
+  register: notes_source_checkout
+
+- name: Скопировать Dockerfile из роли
+  ansible.builtin.copy:
+    src: Dockerfile
+    dest: "{{ notes_deploy_dir }}/Dockerfile"
+    owner: root
+    group: root
+    mode: "0644"
+  register: notes_dockerfile
+
+- name: Скопировать .dockerignore из роли
+  ansible.builtin.copy:
+    src: .dockerignore
+    dest: "{{ notes_deploy_dir }}/.dockerignore"
+    owner: root
+    group: root
+    mode: "0644"
+  register: notes_dockerignore
+
+- name: Скопировать конфигурацию Compose
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ notes_deploy_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Записать локальные переменные Compose с паролем
+  ansible.builtin.template:
+    src: .env.j2
+    dest: "{{ notes_deploy_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Удалить явно перечисленные старые отдельные контейнеры
+  community.docker.docker_container:
+    name: "{{ item }}"
+    state: absent
+    keep_volumes: true
+  loop: "{{ notes_legacy_container_names }}"
+
+- name: Привести Compose-проект к нужному состоянию и дождаться healthcheck
+  community.docker.docker_compose_v2:
+    project_src: "{{ notes_deploy_dir }}"
+    project_name: "{{ notes_compose_project_name }}"
+    state: present
+    build: "{{ 'always' if (notes_source_checkout.changed or notes_dockerfile.changed or notes_dockerignore.changed) else 'policy' }}"
+    pull: missing
+    recreate: auto
+    remove_orphans: true
+    wait: true
+    wait_timeout: "{{ notes_compose_wait_timeout_seconds }}"
+    timeout: "{{ notes_stop_grace_period_seconds }}"
+  no_log: true
+
+- name: Включить cron
+  ansible.builtin.systemd_service:
+    name: cron
+    state: started
+    enabled: true
+
+- name: Ежедневно очищать неиспользуемые объекты Docker
+  ansible.builtin.cron:
+    name: notes docker system prune
+    user: root
+    hour: "{{ notes_prune_hour }}"
+    minute: "{{ notes_prune_minute }}"
+    job: "/usr/bin/flock -n /run/notes-docker-prune.lock /usr/bin/docker system prune -f >/dev/null 2>&1"

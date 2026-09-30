@@ -1,0 +1,54 @@
+services:
+  db:
+    image: {{ notes_postgres_image }}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "{{ notes_docker_log_max_size }}"
+        max-file: "{{ notes_docker_log_max_file }}"
+    restart: unless-stopped
+
+  app:
+    build: .
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SHUTDOWN_DELAY_SECONDS: ${SHUTDOWN_DELAY_SECONDS:-3}
+      DB_WAIT_TIMEOUT: ${DB_WAIT_TIMEOUT:-60}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "{{ notes_docker_log_max_size }}"
+        max-file: "{{ notes_docker_log_max_file }}"
+    stop_grace_period: {{ notes_stop_grace_period_seconds }}s
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,55 @@
+---
+# Все переопределяемые параметры роли находятся здесь.
+notes_deploy_dir: /opt/test_app
+notes_compose_project_name: test_app
+notes_app_git_url: https://github.com/bfg-group/test_app.git
+notes_app_git_version: master
+notes_postgres_image: postgres:16-alpine
+
+notes_postgres_db: notes
+notes_postgres_user: notes
+# Обязательно задать через Ansible Vault; в роли нет рабочего пароля.
+notes_postgres_password: ""
+notes_app_port: 8000
+notes_log_level: INFO
+notes_shutdown_delay_seconds: 3
+notes_db_wait_timeout_seconds: 60
+notes_stop_grace_period_seconds: 75
+notes_compose_wait_timeout_seconds: 300
+
+notes_docker_log_max_size: 10m
+notes_docker_log_max_file: 3
+notes_docker_gpg_url: https://download.docker.com/linux/ubuntu/gpg
+notes_docker_apt_url: https://download.docker.com/linux/ubuntu
+notes_docker_prerequisite_packages:
+  - python3-requests  
+  - ca-certificates
+  - git
+  - ufw
+  - cron
+  - util-linux
+notes_docker_conflicting_packages:
+  - docker.io
+  - docker-compose
+  - docker-compose-v2
+  - docker-doc
+  - docker-buildx
+  - podman-docker
+  - containerd
+  - runc
+notes_docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# Порт контейнера публикуется только на 127.0.0.1; снаружи нужен лишь SSH.
+notes_ssh_port: 22
+notes_ssh_allowed_cidrs:
+  - any
+
+# Удаляются только имена, явно заданные оператором. Тома не удаляются.
+notes_legacy_container_names: []
+notes_prune_hour: "3"
+notes_prune_minute: "15"
